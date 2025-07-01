@@ -1,3 +1,16 @@
+import {SpotifyAPI} from './spotify.js';
+import {TelegramBot} from './telegram';
+import {
+    createHTMLResponse,
+    createJSONResponse,
+    createErrorResponse
+} from './utils.js';
+import {
+    createLandingPage,
+    createSuccessPage,
+    createErrorPage
+} from './templates.js';
+
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -13,282 +26,168 @@ export default {
             return new Response(null, {headers: corsHeaders});
         }
 
+        const spotify = new SpotifyAPI(env);
+        const telegram = new TelegramBot(env);
+
         try {
             switch (path) {
                 case '/':
-                    return new Response('Telegram Spotify Status Bot', {headers: corsHeaders});
+                    return handleLandingPage(request, env);
 
                 case '/auth':
-                    return handleAuth(request, env);
+                    return handleAuth(request, env, spotify);
 
                 case '/auth/callback':
-                    return handleAuthCallback(request, env);
+                    return handleAuthCallback(request, env, spotify, telegram);
 
                 case '/current-track':
-                    return handleCurrentTrack(request, env);
+                    return handleCurrentTrack(request, env, spotify);
 
                 case '/webhook':
-                    return handleWebhook(request, env);
+                    return telegram.handleWebhook(request, spotify);
+
+                case '/update-now':
+                    ctx.waitUntil(updateAllProgressBars(env));
+                    return createJSONResponse({success: true, message: 'Update started'});
 
                 default:
-                    return new Response('Not Found', {status: 404, headers: corsHeaders});
+                    return createErrorResponse('Not Found', 404);
             }
         } catch (error) {
             console.error('Error:', error);
-            return new Response('Internal Error', {
-                status: 500,
-                headers: corsHeaders
-            });
+            return createErrorResponse('Internal Error', 500);
         }
     },
 
     async scheduled(event, env, ctx) {
-        ctx.waitUntil(updateAllProgressBars(env));
+        console.log('Starting update cycle every 10 seconds...');
+
+        const promises = [];
+
+        for (let i = 0; i < 6; i++) {
+            promises.push(
+                new Promise(async (resolve) => {
+                    await sleep(i * 10000);
+
+                    try {
+                        await updateAllProgressBars(env);
+                        console.log(`Update cycle ${i + 1}/6 completed (${i * 10}s offset)`);
+                    } catch (error) {
+                        console.error(`Update cycle ${i + 1}/6 failed:`, error);
+                    }
+
+                    resolve();
+                })
+            );
+        }
+
+        ctx.waitUntil(Promise.all(promises));
     }
 };
 
+// Лендинг страница
+async function handleLandingPage(request, env) {
+    const botUsername = env.TELEGRAM_BOT_USERNAME || 'your_spotify_bot';
+    const html = createLandingPage(botUsername);
+    return createHTMLResponse(html, {cache: 'public, max-age=3600'});
+}
+
 // Генерация URL для авторизации Spotify
-async function handleAuth(request, env) {
+async function handleAuth(request, env, spotify) {
     const url = new URL(request.url);
     const userId = url.searchParams.get('user_id');
 
     if (!userId) {
-        return new Response('Missing user_id parameter', {status: 400});
+        return createErrorResponse('Missing user_id parameter', 400);
     }
 
-    const scopes = [
-        'user-read-currently-playing',
-        'user-read-playback-state',
-        'user-read-recently-played'
-    ].join(' ');
-
-    const state = btoa(JSON.stringify({userId, timestamp: Date.now()}));
-
-    const authUrl = `https://accounts.spotify.com/authorize?` +
-        `client_id=${env.SPOTIFY_CLIENT_ID}&` +
-        `response_type=code&` +
-        `redirect_uri=${encodeURIComponent(url.origin + '/auth/callback')}&` +
-        `scope=${encodeURIComponent(scopes)}&` +
-        `state=${state}`;
+    const redirectUri = url.origin + '/auth/callback';
+    const authUrl = spotify.getAuthUrl(userId, redirectUri);
 
     return Response.redirect(authUrl, 302);
 }
 
 // Обработка callback после авторизации
-async function handleAuthCallback(request, env) {
+async function handleAuthCallback(request, env, spotify, telegram) {
     const url = new URL(request.url);
     const code = url.searchParams.get('code');
     const state = url.searchParams.get('state');
     const error = url.searchParams.get('error');
 
     if (error) {
-        return new Response(`Authorization error: ${error}`, {status: 400});
+        return createErrorResponse(`Authorization error: ${error}`, 400);
     }
 
     if (!code || !state) {
-        return new Response('Missing code or state parameter', {status: 400});
+        return createErrorResponse('Missing code or state parameter', 400);
     }
 
     try {
         const {userId} = JSON.parse(atob(state));
 
-        const tokens = await exchangeCodeForTokens(code, url.origin + '/auth/callback', env);
+        const redirectUri = url.origin + '/auth/callback';
+        const tokens = await spotify.exchangeCodeForTokens(code, redirectUri);
 
-        await env.TOKENS.put(`spotify:${userId}`, JSON.stringify({
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: Date.now() + (tokens.expires_in * 1000),
-            created_at: Date.now()
-        }));
+        await spotify.saveUserTokens(userId, tokens);
 
-        return new Response(`
-      <html>
-        <head><title>Spotify Connected!</title></head>
-        <body style="font-family: Arial; text-align: center; padding: 50px;">
-          <h1>✅ Spotify подключен!</h1>
-          <p>Теперь ваша музыка будет отображаться в Telegram профиле</p>
-          <p>Можете закрыть эту вкладку</p>
-        </body>
-      </html>
-    `, {
-            headers: {'Content-Type': 'text/html'}
-        });
+        const telegramUserId = userId.replace('tg_', '');
+        await telegram.notifyConnectionSuccess(telegramUserId);
+
+        const html = createSuccessPage();
+        return createHTMLResponse(html);
     } catch (error) {
         console.error('Auth callback error:', error);
-        return new Response('Authorization failed', {status: 500});
+        const html = createErrorPage('Ошибка авторизации', 'Не удалось получить токены от Spotify');
+        return createHTMLResponse(html, {status: 500});
     }
-}
-
-// Обмен authorization code на токены
-async function exchangeCodeForTokens(code, redirectUri, env) {
-    const response = await fetch('https://accounts.spotify.com/api/token', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': `Basic ${btoa(env.SPOTIFY_CLIENT_ID + ':' + env.SPOTIFY_CLIENT_SECRET)}`
-        },
-        body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            code: code,
-            redirect_uri: redirectUri
-        })
-    });
-
-    if (!response.ok) {
-        throw new Error(`Token exchange failed: ${response.status}`);
-    }
-
-    return await response.json();
-}
-
-// Обновление access token
-async function refreshAccessToken(refreshToken, env) {
-    const response = await fetch('https://accounts.spotify.com/api/token', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': `Basic ${btoa(env.SPOTIFY_CLIENT_ID + ':' + env.SPOTIFY_CLIENT_SECRET)}`
-        },
-        body: new URLSearchParams({
-            grant_type: 'refresh_token',
-            refresh_token: refreshToken
-        })
-    });
-
-    if (!response.ok) {
-        throw new Error(`Token refresh failed: ${response.status}`);
-    }
-
-    return await response.json();
-}
-
-// Получение текущего трека
-async function getCurrentTrack(accessToken) {
-    const response = await fetch('https://api.spotify.com/v1/me/player/currently-playing', {
-        headers: {
-            'Authorization': `Bearer ${accessToken}`
-        }
-    });
-
-    if (response.status === 204) {
-        return null;
-    }
-
-    if (!response.ok) {
-        throw new Error(`Spotify API error: ${response.status}`);
-    }
-
-    return await response.json();
 }
 
 // Обработка запроса текущего трека
-async function handleCurrentTrack(request, env) {
+async function handleCurrentTrack(request, env, spotify) {
     const url = new URL(request.url);
     const userId = url.searchParams.get('user_id');
 
     if (!userId) {
-        return new Response('Missing user_id parameter', {status: 400});
+        return createErrorResponse('Missing user_id parameter', 400);
     }
 
     try {
-        const tokenData = await env.TOKENS.get(`spotify:${userId}`, 'json');
-
-        if (!tokenData) {
-            return new Response('User not authorized', {status: 401});
-        }
-
-        let accessToken = tokenData.access_token;
-
-        if (Date.now() >= tokenData.expires_at) {
-            const newTokens = await refreshAccessToken(tokenData.refresh_token, env);
-            accessToken = newTokens.access_token;
-
-            await env.TOKENS.put(`spotify:${userId}`, JSON.stringify({
-                ...tokenData,
-                access_token: newTokens.access_token,
-                expires_at: Date.now() + (newTokens.expires_in * 1000)
-            }));
-        }
-
-        const track = await getCurrentTrack(accessToken);
-
-        return new Response(JSON.stringify(track), {
-            headers: {'Content-Type': 'application/json'}
-        });
+        const track = await spotify.getCurrentTrackForUser(userId);
+        return createJSONResponse(track);
     } catch (error) {
         console.error('Current track error:', error);
-        return new Response('Failed to get current track', {status: 500});
+        return createErrorResponse('Failed to get current track', 500);
     }
 }
 
-// Обработка webhook от Telegram
-async function handleWebhook(request, env) {
-    return new Response('OK');
-}
-
-// Обновление всех прогресс-баров (cron job)
+// Обновление всех прогресс-баров
 async function updateAllProgressBars(env) {
-    const userKeys = await env.TOKENS.list({prefix: 'spotify:'});
+    const spotify = new SpotifyAPI(env);
+    const telegram = new TelegramBot(env);
 
-    for (const key of userKeys.keys) {
-        const userId = key.name.replace('spotify:', '');
+    try {
+        const userIds = await spotify.getAllUsers();
+        console.log(`Updating ${userIds.length} users`);
 
-        try {
-            const track = await getCurrentTrackForUser(userId, env);
+        for (const userId of userIds) {
+            try {
+                const track = await spotify.getCurrentTrackForUser(userId);
 
-            if (track && track.is_playing) {
-                await updateTelegramChannel(userId, track, env);
+                await telegram.updateChannelContent(userId, track);
+
+                await sleep(200);
+            } catch (error) {
+                console.error(`Error updating user ${userId}:`, error);
             }
-        } catch (error) {
-            console.error(`Error updating user ${userId}:`, error);
         }
+
+        console.log('Update cycle completed successfully');
+    } catch (error) {
+        console.error('Error in updateAllProgressBars:', error);
     }
 }
 
-async function getCurrentTrackForUser(userId, env) {
-    const tokenData = await env.TOKENS.get(`spotify:${userId}`, 'json');
-
-    if (!tokenData) return null;
-
-    let accessToken = tokenData.access_token;
-
-    if (Date.now() >= tokenData.expires_at) {
-        const newTokens = await refreshAccessToken(tokenData.refresh_token, env);
-        accessToken = newTokens.access_token;
-
-        await env.TOKENS.put(`spotify:${userId}`, JSON.stringify({
-            ...tokenData,
-            access_token: newTokens.access_token,
-            expires_at: Date.now() + (newTokens.expires_in * 1000)
-        }));
-    }
-
-    return await getCurrentTrack(accessToken);
-}
-
-async function updateTelegramChannel(userId, track, env) {
-    const progressBar = createProgressBar(track.progress_ms, track.item.duration_ms);
-
-    console.log(`Updating ${userId}: ${track.item.name} - ${progressBar}`);
-}
-
-function createProgressBar(current, total) {
-    const progress = current / total;
-    const barLength = 20;
-    const filledLength = Math.floor(progress * barLength);
-
-    const filled = '━'.repeat(filledLength);
-    const dot = '●';
-    const empty = '─'.repeat(Math.max(0, barLength - filledLength - 1));
-
-    const currentTime = formatTime(current);
-    const remainingTime = formatTime(total - current);
-
-    return `${currentTime} ${filled}${dot}${empty} -${remainingTime}`;
-}
-
-function formatTime(ms) {
-    const minutes = Math.floor(ms / 60000);
-    const seconds = Math.floor((ms % 60000) / 1000);
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+// Утилита для сна
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }

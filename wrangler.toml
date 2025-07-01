@@ -2,16 +2,27 @@ name = "spotify-to-tg"
 main = "main.js"
 compatibility_date = "2024-09-23"
 
+[[modules]]
+type = "ESModule"
+globs = ["**/*.js"]
+
+[[modules]]
+type = "Text"
+globs = ["**/*.css"]
+
 [vars]
 SPOTIFY_CLIENT_ID = "a9611e578b8a44208fa30337b16e6701"
+TELEGRAM_BOT_USERNAME = "spotify_to_tg_bot"
+TELEGRAM_BOT_ID = 8019017151
 
 [[kv_namespaces]]
 binding = "TOKENS"
 id = "5707f3dfa09f4741a894f070dc278879"
 preview_id = "1e9b1470dd6f4751af3e996a56599129"
 
+# Просто делаем cron каждую минуту но запускаем несколько обновлений подряд
 [triggers]
-crons = ["0/5 * * * * *"]  # Каждые 5 секунд
+crons = ["* * * * *"]  # Каждую минуту
 
 [env.production]
 name = "spotify-to-tg-prod"
